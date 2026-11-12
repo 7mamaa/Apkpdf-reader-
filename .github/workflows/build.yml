@@ -7,13 +7,13 @@ jobs:
   apk:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: "8.7" }
       - name: Create project
         run: |
-          mkdir -p app/src/main/java/app/fastview
+          mkdir -p app/src/main/java/app/fastview app/src/main/res/drawable
           cat > settings.gradle.kts << 'EOF_FILE'
           pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
           dependencyResolutionManagement { repositories { google(); mavenCentral() } }
@@ -48,7 +48,8 @@ jobs:
           EOF_FILE
           cat > app/src/main/AndroidManifest.xml << 'EOF_FILE'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-              <application android:label="FastView" android:theme="@android:style/Theme.DeviceDefault.DayNight">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application android:label="FastView" android:icon="@drawable/ic" android:theme="@android:style/Theme.DeviceDefault.DayNight">
                   <activity android:name=".MainActivity" android:exported="true"
                       android:configChanges="orientation|screenSize|keyboardHidden">
                       <intent-filter>
@@ -62,9 +63,21 @@ jobs:
                           <data android:scheme="file"/>
                           <data android:mimeType="*/*"/>
                       </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND"/>
+                          <category android:name="android.intent.category.DEFAULT"/>
+                          <data android:mimeType="*/*"/>
+                      </intent-filter>
                   </activity>
               </application>
           </manifest>
+          EOF_FILE
+          cat > app/src/main/res/drawable/ic.xml << 'EOF_FILE'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="48dp" android:height="48dp" android:viewportWidth="48" android:viewportHeight="48">
+              <path android:fillColor="#2E7D32" android:pathData="M0,0h48v48h-48z"/>
+              <path android:fillColor="#FFFFFF" android:pathData="M14,8h14l8,8v24h-22z"/>
+              <path android:fillColor="#2E7D32" android:pathData="M18,24h16v2h-16zM18,30h16v2h-16zM18,36h10v2h-10z"/>
+          </vector>
           EOF_FILE
           cat > app/src/main/java/app/fastview/Office.kt << 'EOF_FILE'
           package app.fastview
@@ -179,41 +192,197 @@ jobs:
                   }
                   return sb.toString()
               }
+
+              fun odf(ins: InputStream): String {
+                  val d = zip(ins) { it == "content.xml" }["content.xml"] ?: return "Not a valid OpenDocument file"
+                  val x = parser(d)
+                  val sb = StringBuilder()
+                  var ev = x.eventType
+                  while (ev != XmlPullParser.END_DOCUMENT) {
+                      if (ev == XmlPullParser.TEXT) sb.append(x.text)
+                      else if (ev == XmlPullParser.END_TAG) {
+                          when (x.name) {
+                              "text:p", "text:h", "table:table-row" -> sb.append('\n')
+                              "table:table-cell" -> sb.append('\t')
+                          }
+                      }
+                      ev = x.next()
+                  }
+                  return sb.toString()
+              }
           }
           EOF_FILE
           cat > app/src/main/java/app/fastview/MainActivity.kt << 'EOF_FILE'
           package app.fastview
 
           import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.Intent
-          import android.graphics.Bitmap
-          import android.graphics.Color
-          import android.graphics.Typeface
+          import android.content.SharedPreferences
+          import android.graphics.*
           import android.graphics.pdf.PdfRenderer
           import android.net.Uri
           import android.os.Bundle
           import android.provider.OpenableColumns
+          import android.text.SpannableStringBuilder
+          import android.text.Spanned
+          import android.text.style.BackgroundColorSpan
+          import android.text.style.ForegroundColorSpan
+          import android.text.style.RelativeSizeSpan
+          import android.text.style.StyleSpan
           import android.util.LruCache
-          import android.view.View
-          import android.view.ViewGroup
-          import android.widget.AbsListView
-          import android.widget.BaseAdapter
-          import android.widget.ImageView
-          import android.widget.ListView
-          import android.widget.TextView
+          import android.view.*
+          import android.widget.*
           import java.util.concurrent.Executors
 
           class MainActivity : Activity() {
               private val bg = Executors.newSingleThreadExecutor()
               private lateinit var list: ListView
-              private var renderer: PdfRenderer? = null
+              private lateinit var root: HorizontalScrollView
+              private lateinit var spin: Spinner
+              private lateinit var prefs: SharedPreferences
+              private var th = 0
+              private val night get() = th == 1
+              private var fs = 13f
+              private var z = 1f
+              private var pend = 1f
+              private var gen = 0
+              private var pdf: PdfRenderer? = null
+              private var full = ""
+              private var raw = ""
+              private var name = ""
+              private var key = ""
+              private var restore = 0
+              private var cur: Uri? = null
+              private var curExt = ""
+              private var nums = false
+              private var mono = true
+              private var lock = false
+              private var asc = true
+              private var sortCol = -1
+              private var filt = ""
+              private var sheet = 0
+              private var sheets: List<List<List<String>>> = emptyList()
+              private lateinit var bar: LinearLayout
+              private lateinit var spin2: Spinner
+              private val sep = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                  0.96f, 0f, 0f, 0f, 0f, 0f, 0.9f, 0f, 0f, 0f, 0f, 0f, 0.76f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)))
+              private val CODE = setOf("py", "js", "ts", "java", "kt", "c", "cpp", "h", "cs", "go", "rs", "json", "html", "xml",
+                  "sh", "sql", "css", "yml", "yaml", "rb", "php", "swift")
+              private val HASH = setOf("py", "sh", "yml", "yaml", "rb")
+              private val KW = Regex("\\b(def|class|import|from|return|if|elif|else|for|while|in|not|and|or|try|except|finally|with|as|pass|None|True|False|function|const|let|var|new|public|private|static|void|int|string|true|false|null|this|self|async|await|lambda|raise|yield|fun|val)\\b")
+              private val STRS = Regex("\"[^\"\\n]*\"|'[^'\\n]*'")
+              private val CMT_H = Regex("#.*")
+              private val CMT_S = Regex("//.*")
+              private val BUL = Regex("^(\\s*)[-*] ")
+              private var q = ""
+              private var qpos = 0
+              private var grid: List<List<String>>? = null
+              private var mode = 0
+              private var hs = false
+              private var maxLen = 0
+              private var chunks: List<CharSequence> = emptyList()
+              private var cache: LruCache<Int, Bitmap>? = null
+              private var ad: BaseAdapter? = null
+              private val busy = HashSet<Int>()
+              private val inv = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                  -1f, 0f, 0f, 0f, 255f, 0f, -1f, 0f, 0f, 255f, 0f, 0f, -1f, 0f, 255f, 0f, 0f, 0f, 1f, 0f)))
+              private val dm get() = resources.displayMetrics
+
+              private val sg by lazy {
+                  ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                      override fun onScaleBegin(d: ScaleGestureDetector): Boolean { pend = 1f; return true }
+                      override fun onScale(d: ScaleGestureDetector): Boolean {
+                          if (pdf == null) { fs = (fs * d.scaleFactor).coerceIn(8f, 40f); fit(); ad?.notifyDataSetChanged() }
+                          else pend *= d.scaleFactor
+                          return true
+                      }
+                      override fun onScaleEnd(d: ScaleGestureDetector) { if (pdf != null) setZ((z * pend).coerceIn(1f, 3f)); pend = 1f }
+                  })
+              }
+              private val gd by lazy {
+                  GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+                      override fun onDoubleTap(e: MotionEvent): Boolean {
+                          if (pdf == null) return false
+                          setZ(if (z > 1.2f) 1f else 2f); return true
+                      }
+                  })
+              }
 
               override fun onCreate(b: Bundle?) {
                   super.onCreate(b)
-                  list = ListView(this).apply { divider = null }
-                  setContentView(list)
-                  val uri = intent?.data
-                  if (uri != null) open(uri) else pick()
+                  prefs = getSharedPreferences("p", 0)
+                  th = prefs.getInt("th", 0)
+                  fs = prefs.getFloat("fs", 13f)
+                  list = ListView(this).apply {
+                      divider = null; isFastScrollEnabled = true
+                      setOnScrollListener(object : AbsListView.OnScrollListener {
+                          override fun onScroll(v: AbsListView, f: Int, vc: Int, tc: Int) { if (pdf != null) title = "$name  ${f + 1}/$tc" }
+                          override fun onScrollStateChanged(v: AbsListView, s: Int) {}
+                      })
+                  }
+                  root = HorizontalScrollView(this).apply { isFillViewport = true; addView(list, FrameLayout.LayoutParams(-1, -1)) }
+                  spin = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("Table", "Column", "Raw"))
+                      onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                          override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) { if (grid != null && pos != mode) { mode = pos; rebuild() } }
+                          override fun onNothingSelected(p: AdapterView<*>?) {}
+                      }
+                  }
+                  spin2 = Spinner(this).apply {
+                      visibility = View.GONE
+                      onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                          override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                              if (pos != sheet && pos < sheets.size) { sheet = pos; grid = sheets[pos]; rebuild() }
+                          }
+                          override fun onNothingSelected(p: AdapterView<*>?) {}
+                      }
+                  }
+                  bar = LinearLayout(this).apply {
+                      visibility = View.GONE
+                      addView(spin, LinearLayout.LayoutParams(0, -2, 1f))
+                      addView(spin2, LinearLayout.LayoutParams(0, -2, 1f))
+                  }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      addView(bar, LinearLayout.LayoutParams(-1, -2))
+                      addView(root, LinearLayout.LayoutParams(-1, 0, 1f))
+                  })
+                  paint()
+                  val uri = intent?.data ?: intent?.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                  if (uri != null) open(uri) else showRecents()
+              }
+
+              override fun dispatchTouchEvent(e: MotionEvent): Boolean { sg.onTouchEvent(e); gd.onTouchEvent(e); return super.dispatchTouchEvent(e) }
+
+              override fun onPause() {
+                  super.onPause()
+                  val ed = prefs.edit().putFloat("fs", fs)
+                  if (key.isNotEmpty()) ed.putInt("p$key", list.firstVisiblePosition)
+                  ed.apply()
+              }
+
+              private fun bgc() = if (pdf != null) (if (th == 1) Color.BLACK else Color.DKGRAY)
+                  else when (th) { 1 -> 0xFF121212.toInt(); 2 -> 0xFFF4ECD8.toInt(); else -> Color.WHITE }
+              private fun fg() = when (th) { 1 -> 0xFFDDDDDD.toInt(); 2 -> 0xFF3B2F1E.toInt(); else -> Color.BLACK }
+
+              private fun paint() {
+                  val c = bgc()
+                  root.setBackgroundColor(c); list.setBackgroundColor(c)
+                  ad?.notifyDataSetChanged()
+              }
+
+              private fun setZ(nz: Float) {
+                  z = nz; gen++; cache?.evictAll()
+                  list.layoutParams = FrameLayout.LayoutParams((dm.widthPixels * z).toInt(), -1)
+                  ad?.notifyDataSetChanged()
+              }
+
+              private fun fit() {
+                  val w = if (hs) (maxLen * fs * dm.scaledDensity * 0.62f).toInt() + 40 else -1
+                  list.layoutParams = FrameLayout.LayoutParams(if (w > dm.widthPixels) w else -1, -1)
               }
 
               private fun pick() = startActivityForResult(
@@ -224,23 +393,233 @@ jobs:
                   if (u != null) open(u) else if (list.adapter == null) finish()
               }
 
+              // ---- menu
+              override fun onCreateOptionsMenu(m: Menu): Boolean {
+                  listOf("Copy all", "Night mode", "Open file", "Find", "Find next", "Go to page/line", "Recent", "Share", "Add bookmark", "Bookmarks", "Filter rows", "Sort column", "Line numbers", "Toggle font", "Lock rotation", "Open URL").forEachIndexed { i, s -> m.add(0, i + 1, i, s) }
+                  m.findItem(8).setIcon(android.R.drawable.ic_menu_share).setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                  return true
+              }
+              override fun onPrepareOptionsMenu(m: Menu): Boolean { m.findItem(2).title = arrayOf("Night mode", "Sepia mode", "Day mode")[th]; return true }
+              override fun onOptionsItemSelected(i: MenuItem): Boolean {
+                  when (i.itemId) {
+                      1 -> copyAll()
+                      2 -> { th = (th + 1) % 3; prefs.edit().putInt("th", th).apply(); paint() }
+                      3 -> pick()
+                      4 -> if (pdf != null) toast("Search works on text files") else ask("Find", false) { q = it; qpos = 0; next() }
+                      5 -> next()
+                      6 -> ask("Page / line number", true) { s -> s.toIntOrNull()?.let { list.setSelection(if (pdf != null) it - 1 else (it - 1) / 60) } }
+                      7 -> showRecents()
+                      8 -> share()
+                      9 -> bmAdd()
+                      10 -> bmList()
+                      11 -> if (grid == null) toast("CSV / xlsx only") else ask("Filter rows", false) { filt = it; rebuild() }
+                      12 -> if (grid == null) toast("CSV / xlsx only") else ask("Sort by column #", true) { s ->
+                          s.toIntOrNull()?.let { n -> if (sortCol == n - 1) asc = !asc else { sortCol = n - 1; asc = true }; rebuild() }
+                      }
+                      13 -> { nums = !nums; if (grid != null) rebuild() else if (pdf == null) rechunk() }
+                      14 -> { mono = !mono; ad?.notifyDataSetChanged() }
+                      15 -> {
+                          lock = !lock
+                          requestedOrientation = if (lock) android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LOCKED
+                              else android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                          toast(if (lock) "Rotation locked" else "Rotation free")
+                      }
+                      16 -> ask("URL", false) { openUrl(it.trim()) }
+                  }
+                  return true
+              }
+
+              private fun share() {
+                  val u = cur ?: return toast("No file open")
+                  try {
+                      startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType(contentResolver.getType(u) ?: "*/*")
+                          .putExtra(Intent.EXTRA_STREAM, u).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION), null))
+                  } catch (e: Throwable) { toast("Cannot share this file") }
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              private fun ask(t: String, num: Boolean, f: (String) -> Unit) {
+                  val et = EditText(this)
+                  if (num) et.inputType = 2
+                  AlertDialog.Builder(this).setTitle(t).setView(et).setPositiveButton("OK") { _, _ -> f(et.text.toString()) }.show()
+              }
+
+              // ---- bookmarks / url / rechunk
+              private fun lab(p: Int) = if (pdf != null) "Page ${p + 1}" else "Line ${p * 60 + 1}"
+
+              private fun bmAdd() {
+                  if (key.isEmpty()) return
+                  val p = list.firstVisiblePosition
+                  prefs.edit().putString("b$key", prefs.getString("b$key", "") + p + "\n").apply()
+                  toast("Bookmarked " + lab(p))
+              }
+
+              private fun bmList() {
+                  val ps = prefs.getString("b$key", "")!!.split('\n').mapNotNull { it.toIntOrNull() }.distinct().sorted()
+                  if (ps.isEmpty()) { toast("No bookmarks"); return }
+                  AlertDialog.Builder(this).setTitle("Bookmarks")
+                      .setItems(ps.map { lab(it) }.toTypedArray()) { _, i -> list.setSelection(ps[i]) }.show()
+              }
+
+              private fun openUrl(s: String) {
+                  toast("Downloading...")
+                  bg.execute {
+                      try {
+                          val f = java.io.File(cacheDir, Uri.parse(s).lastPathSegment ?: "download")
+                          java.net.URL(s).openStream().use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                          runOnUiThread { open(Uri.fromFile(f)) }
+                      } catch (e: Throwable) { runOnUiThread { toast("Download failed") } }
+                  }
+              }
+
+              private fun rechunk() {
+                  val t = full; val e = curExt
+                  restore = list.firstVisiblePosition
+                  bg.execute { val ch = chunk(t, e); runOnUiThread { chunks = ch; showText() } }
+              }
+
+              private fun sheetsOf(t: String): List<List<List<String>>> {
+                  val out = ArrayList<List<List<String>>>()
+                  var cur = ArrayList<List<String>>()
+                  for (l in t.split('\n')) {
+                      if (l.startsWith("# Sheet ")) { if (cur.isNotEmpty()) out.add(cur); cur = ArrayList() }
+                      else cur.add(l.split('\t').dropLastWhile { it.isEmpty() })
+                  }
+                  if (cur.isNotEmpty()) out.add(cur)
+                  return out.ifEmpty { listOf(listOf(listOf(t))) }
+              }
+
+              // ---- search / copy
+              private fun next() {
+                  if (q.isEmpty()) return
+                  var i = full.indexOf(q, qpos, true)
+                  if (i < 0 && qpos > 0) { qpos = 0; i = full.indexOf(q, 0, true) }
+                  if (i < 0) { toast("Not found"); return }
+                  qpos = i + 1
+                  var line = 0
+                  for (k in 0 until i) if (full[k] == '\n') line++
+                  list.setSelection(line / 60); ad?.notifyDataSetChanged()
+              }
+
+              private fun hl(cs: CharSequence): CharSequence {
+                  if (q.isEmpty()) return cs
+                  val str = cs.toString()
+                  var i = str.indexOf(q, 0, true)
+                  if (i < 0) return cs
+                  val s = SpannableStringBuilder(cs)
+                  while (i >= 0) {
+                      s.setSpan(BackgroundColorSpan(0xFFFFEB3B.toInt()), i, i + q.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                      s.setSpan(ForegroundColorSpan(Color.BLACK), i, i + q.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                      i = str.indexOf(q, i + q.length, true)
+                  }
+                  return s
+              }
+
+              private fun clip(s: String) {
+                  (getSystemService(CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("t", s.take(900_000)))
+                  toast("Copied")
+              }
+
+              private fun copyAll() {
+                  val r = pdf ?: return clip(if (grid != null) raw else full)
+                  bg.execute {
+                      val t = pdfText(r)
+                      runOnUiThread { if (t.isNullOrBlank()) toast("No PDF text (needs Android 15+, not scanned)") else clip(t) }
+                  }
+              }
+
+              private fun pdfText(r: PdfRenderer): String? = try {
+                  val sb = StringBuilder()
+                  for (i in 0 until r.pageCount) synchronized(r) {
+                      val pg = r.openPage(i)
+                      try {
+                          val l = pg.javaClass.getMethod("getTextContents").invoke(pg) as List<*>
+                          for (c in l) sb.append(c!!.javaClass.getMethod("getText").invoke(c)).append('\n')
+                          sb.append('\n')
+                      } finally { pg.close() }
+                  }
+                  sb.toString()
+              } catch (e: Throwable) { null }
+
+              // ---- recents
+              private fun recents(): List<Pair<String, String>> =
+                  prefs.getString("r", "")!!.split('\n').filter { it.contains('\t') }.map { it.substringBefore('\t') to it.substringAfter('\t') }
+
+              private fun addRecent(u: Uri, n: String) {
+                  try { contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Throwable) {}
+                  val l = listOf(u.toString() to n) + recents().filter { it.first != u.toString() }
+                  prefs.edit().putString("r", l.take(15).joinToString("\n") { "${it.first}\t${it.second}" }).apply()
+              }
+
+              private fun reset() {
+                  try { pdf?.close() } catch (e: Throwable) {}
+                  pdf = null; cur = null; busy.clear(); gen++; z = 1f; grid = null; hs = false; q = ""; key = ""
+                  bar.visibility = View.GONE; filt = ""; sortCol = -1; sheets = emptyList()
+                  list.onItemClickListener = null
+                  list.layoutParams = FrameLayout.LayoutParams(-1, -1)
+                  cache?.evictAll()
+              }
+
+              private fun showRecents() {
+                  reset(); title = "FastView"
+                  val r = recents()
+                  val items = listOf("Open file...") + r.map { it.second }
+                  val pad = (16 * dm.density).toInt()
+                  ad = object : BaseAdapter() {
+                      override fun getCount() = items.size
+                      override fun getItem(i: Int): Any = i
+                      override fun getItemId(i: Int) = i.toLong()
+                      override fun getView(i: Int, v: View?, p: ViewGroup): View {
+                          val tv = (v as? TextView) ?: TextView(this@MainActivity).apply { textSize = 16f; setPadding(pad, pad, pad, pad) }
+                          tv.text = items[i]
+                          tv.setTextColor(fg())
+                          return tv
+                      }
+                  }
+                  list.adapter = ad
+                  list.setOnItemClickListener { _, _, i, _ -> if (i == 0) pick() else open(Uri.parse(r[i - 1].first)) }
+                  paint()
+              }
+
+              // ---- open
               private fun fileName(u: Uri): String {
                   val n = try {
                       contentResolver.query(u, null, null, null, null)?.use { c ->
                           if (c.moveToFirst()) c.getString(c.getColumnIndexOrThrow(OpenableColumns.DISPLAY_NAME)) else null
                       }
                   } catch (e: Exception) { null }
-                  return n ?: (u.lastPathSegment ?: "")
+                  return n ?: (u.lastPathSegment ?: "file")
               }
 
               private fun open(u: Uri) {
-                  val n = fileName(u)
-                  title = n
-                  val ext = n.substringAfterLast('.', "").lowercase()
-                  if (ext == "pdf" || contentResolver.getType(u) == "application/pdf") { showPdf(u); return }
+                  reset()
+                  cur = u; name = fileName(u); title = name
+                  key = "k" + name.hashCode()
+                  restore = prefs.getInt("p$key", 0)
+                  addRecent(u, name)
+                  val ext = name.substringAfterLast('.', "").lowercase()
+                  if (ext == "pdf" || contentResolver.getType(u) == "application/pdf") {
+                      try { showPdf(u) } catch (e: Throwable) { chunks = listOf("Cannot open: ${e.message}"); showText() }
+                      return
+                  }
+                  curExt = ext
                   bg.execute {
                       val t = try { readText(u, ext) } catch (e: Throwable) { "Cannot open: ${e.message}" }
-                      runOnUiThread { showText(t, ext == "md" || ext == "markdown") }
+                      val sh = when (ext) {
+                          "csv" -> listOf(csv(t, ',')); "tsv" -> listOf(csv(t, '\t')); "xlsx" -> sheetsOf(t)
+                          else -> null
+                      }
+                      val ch = if (sh == null) chunk(t, ext) else emptyList()
+                      runOnUiThread {
+                          raw = t; sheets = sh ?: emptyList(); sheet = 0; grid = sh?.get(0)
+                          if (sh != null) {
+                              mode = 0; spin.setSelection(0)
+                              spin2.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, sh.indices.map { "Sheet ${it + 1}" })
+                              spin2.visibility = if (sh.size > 1) View.VISIBLE else View.GONE
+                              bar.visibility = View.VISIBLE; rebuild()
+                          } else { full = t; chunks = ch; showText() }
+                      }
                   }
               }
 
@@ -250,34 +629,153 @@ jobs:
                           "docx" -> Office.docx(it)
                           "pptx" -> Office.pptx(it)
                           "xlsx" -> Office.xlsx(it)
+                          "odt", "ods", "odp" -> Office.odf(it)
                           "xls", "doc", "ppt" -> "Legacy binary .$ext is not supported. Re-save as xlsx / docx / pptx."
                           else -> {
                               val b = it.readBytes()
-                              String(if (b.size > 20_000_000) b.copyOf(20_000_000) else b, Charsets.UTF_8)
+                              if (b.take(4096).any { x -> x.toInt() == 0 }) "Binary file: cannot show as text."
+                              else String(if (b.size > 20_000_000) b.copyOf(20_000_000) else b, Charsets.UTF_8)
                           }
                       }
                   }
 
-              private fun showText(t: String, md: Boolean) {
-                  val lines = t.split('\n')
-                  val pad = (8 * resources.displayMetrics.density).toInt()
-                  list.adapter = object : BaseAdapter() {
-                      override fun getCount() = lines.size
-                      override fun getItem(i: Int): Any = lines[i]
+              // ---- csv / table / column
+              private fun csv(t: String, sep: Char): List<List<String>> {
+                  val rows = ArrayList<List<String>>()
+                  var row = ArrayList<String>()
+                  val c = StringBuilder()
+                  var q = false
+                  var i = 0
+                  while (i < t.length) {
+                      val ch = t[i]
+                      if (q) {
+                          if (ch == '"') { if (i + 1 < t.length && t[i + 1] == '"') { c.append('"'); i++ } else q = false } else c.append(ch)
+                      } else when (ch) {
+                          '"' -> q = true
+                          sep -> { row.add(c.toString()); c.setLength(0) }
+                          '\n' -> { row.add(c.toString().trimEnd('\r')); c.setLength(0); rows.add(row); row = ArrayList() }
+                          else -> c.append(ch)
+                      }
+                      i++
+                  }
+                  if (c.isNotEmpty() || row.isNotEmpty()) { row.add(c.toString()); rows.add(row) }
+                  return rows
+              }
+
+              private fun table(g: List<List<String>>): String {
+                  val n = g.maxOfOrNull { it.size } ?: 0
+                  val w = IntArray(n) { c -> minOf(30, g.maxOf { r -> if (c < r.size) r[c].length else 0 }) }
+                  return g.joinToString("\n") { r ->
+                      r.withIndex().joinToString(" | ") { (c, s) -> s.replace('\n', ' ').take(w[c]).padEnd(w[c]) }
+                  }
+              }
+
+              private fun column(g: List<List<String>>): String {
+                  val h = g.firstOrNull() ?: return ""
+                  return g.drop(1).withIndex().joinToString("\n\n") { (i, r) ->
+                      "#${i + 1}\n" + r.withIndex().joinToString("\n") { (c, s) -> "${h.getOrElse(c) { "col${c + 1}" }}: $s" }
+                  }
+              }
+
+              private fun rebuild() {
+                  val g0 = grid ?: return
+                  if (g0.isEmpty()) return
+                  val m = mode; val f = filt; val c = sortCol; val up = asc
+                  bg.execute {
+                      var g = g0
+                      if (f.isNotEmpty()) g = listOf(g[0]) + g.drop(1).filter { r -> r.any { it.contains(f, true) } }
+                      if (c >= 0) g = listOf(g[0]) + g.drop(1).sortedWith(Comparator { a: List<String>, b: List<String> ->
+                          val x = a.getOrElse(c) { "" }; val y = b.getOrElse(c) { "" }
+                          val dx = x.toDoubleOrNull(); val dy = y.toDoubleOrNull()
+                          (if (dx != null && dy != null) dx.compareTo(dy) else x.compareTo(y, true)) * (if (up) 1 else -1)
+                      })
+                      val t = when (m) { 0 -> table(g); 1 -> column(g); else -> raw }
+                      val ml = t.lineSequence().maxOfOrNull { it.length } ?: 0
+                      val ch = chunk(t, "")
+                      runOnUiThread { full = t; chunks = ch; maxLen = ml; hs = m == 0; showText() }
+                  }
+              }
+
+              // ---- text
+              private fun color(sb: SpannableStringBuilder, ext: String) {
+                  val str = sb.toString()
+                  fun sp(r: Regex, c: Int) {
+                      for (m in r.findAll(str)) sb.setSpan(ForegroundColorSpan(c), m.range.first, m.range.last + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                  }
+                  sp(KW, 0xFF2E86DE.toInt()); sp(STRS, 0xFF2E9E5B.toInt())
+                  sp(if (ext in HASH) CMT_H else CMT_S, 0xFF8A8A8A.toInt())
+              }
+
+              private fun chunk(t: String, ext: String): List<CharSequence> {
+                  val md = ext == "md" || ext == "markdown"
+                  val code = ext in CODE
+                  return t.split('\n').chunked(60).mapIndexed { gi, g ->
+                      val sb = SpannableStringBuilder()
+                      for ((li, l) in g.withIndex()) {
+                          var s = l.trimEnd('\r')
+                          if (nums) sb.append("${gi * 60 + li + 1}  ")
+                          val st = sb.length
+                          if (md && s.startsWith("#")) {
+                              sb.append(s.trimStart('#', ' '))
+                              sb.setSpan(StyleSpan(Typeface.BOLD), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                              sb.setSpan(RelativeSizeSpan(1.3f), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                          } else {
+                              if (md) s = s.replace(BUL, "\$1\u2022 ")
+                              sb.append(s)
+                          }
+                          sb.append('\n')
+                      }
+                      if (code) color(sb, ext)
+                      sb
+                  }
+              }
+
+              private fun showText() {
+                  val pad = (12 * dm.density).toInt()
+                  ad = object : BaseAdapter() {
+                      override fun getCount() = chunks.size
+                      override fun getItem(i: Int): Any = i
                       override fun getItemId(i: Int) = i.toLong()
                       override fun getView(i: Int, v: View?, p: ViewGroup): View {
-                          val tv = (v as? TextView) ?: TextView(this@MainActivity).apply { setPadding(pad, 0, pad, 0) }
-                          val s = lines[i].trimEnd('\r')
-                          if (md && s.startsWith("#")) {
-                              tv.text = s.trimStart('#', ' ')
-                              tv.typeface = Typeface.DEFAULT_BOLD
-                              tv.textSize = 17f
-                          } else {
-                              tv.text = s
-                              tv.typeface = Typeface.MONOSPACE
-                              tv.textSize = 12f
+                          val tv = (v as? TextView) ?: TextView(this@MainActivity).apply {
+                              typeface = Typeface.MONOSPACE; setTextIsSelectable(true); setPadding(pad, 0, pad, 0)
                           }
+                          tv.setHorizontallyScrolling(hs)
+                          tv.typeface = if (mono) Typeface.MONOSPACE else Typeface.SANS_SERIF
+                          tv.textSize = fs
+                          tv.setTextColor(fg())
+                          tv.text = hl(chunks[i])
                           return tv
+                      }
+                  }
+                  fit()
+                  list.adapter = ad
+                  list.setSelection(restore); restore = 0
+                  paint()
+              }
+
+              // ---- pdf
+              private fun render(i: Int) {
+                  val r = pdf ?: return
+                  if (!busy.add(i)) return
+                  val g = gen
+                  val w = (dm.widthPixels * z).toInt()
+                  bg.execute {
+                      val b = try {
+                          synchronized(r) {
+                              val pg = r.openPage(i)
+                              try {
+                                  val bm = Bitmap.createBitmap(w, maxOf(1, (w * pg.height.toFloat() / pg.width).toInt()), Bitmap.Config.ARGB_8888)
+                                  bm.eraseColor(Color.WHITE)
+                                  pg.render(bm, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                  bm
+                              } finally { pg.close() }
+                          }
+                      } catch (e: Throwable) { null }
+                      runOnUiThread {
+                          busy.remove(i)
+                          if (g != gen) ad?.notifyDataSetChanged()
+                          else if (b != null) { cache?.put(i, b); list.findViewWithTag<ImageView>(i)?.setImageBitmap(b) }
                       }
                   }
               }
@@ -285,12 +783,12 @@ jobs:
               private fun showPdf(u: Uri) {
                   val fd = contentResolver.openFileDescriptor(u, "r") ?: return
                   val r = PdfRenderer(fd)
-                  renderer = r
-                  val w = resources.displayMetrics.widthPixels
-                  val cache = LruCache<Int, Bitmap>(6)
-                  list.setBackgroundColor(Color.DKGRAY)
+                  pdf = r
+                  cache = object : LruCache<Int, Bitmap>((Runtime.getRuntime().maxMemory() / 5).toInt()) {
+                      override fun sizeOf(k: Int, b: Bitmap) = b.byteCount
+                  }
                   list.dividerHeight = 6
-                  list.adapter = object : BaseAdapter() {
+                  ad = object : BaseAdapter() {
                       override fun getCount() = r.pageCount
                       override fun getItem(i: Int): Any = i
                       override fun getItemId(i: Int) = i.toLong()
@@ -298,39 +796,30 @@ jobs:
                           val iv = (v as? ImageView) ?: ImageView(this@MainActivity).apply {
                               adjustViewBounds = true
                               scaleType = ImageView.ScaleType.FIT_CENTER
-                              layoutParams = AbsListView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                              layoutParams = AbsListView.LayoutParams(-1, -2)
                           }
                           iv.tag = i
-                          val c = cache.get(i)
-                          if (c != null) { iv.setImageBitmap(c); return iv }
-                          iv.setImageDrawable(null)
-                          iv.minimumHeight = (w * 1.41f).toInt()
-                          bg.execute {
-                              val bmp = try {
-                                  synchronized(r) {
-                                      val pg = r.openPage(i)
-                                      try {
-                                          val b = Bitmap.createBitmap(w, maxOf(1, (w * pg.height.toFloat() / pg.width).toInt()), Bitmap.Config.ARGB_8888)
-                                          b.eraseColor(Color.WHITE)
-                                          pg.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                                          b
-                                      } finally { pg.close() }
-                                  }
-                              } catch (e: Throwable) { null }
-                              if (bmp != null) runOnUiThread {
-                                  cache.put(i, bmp)
-                                  if (iv.tag == i) iv.setImageBitmap(bmp)
-                              }
+                          iv.colorFilter = when (th) { 1 -> inv; 2 -> sep; else -> null }
+                          val c = cache?.get(i)
+                          if (c != null) iv.setImageBitmap(c)
+                          else {
+                              iv.setImageDrawable(null)
+                              iv.minimumHeight = (dm.widthPixels * z * 1.41f).toInt()
+                              render(i)
                           }
+                          if (i + 1 < r.pageCount && cache?.get(i + 1) == null) render(i + 1)
                           return iv
                       }
                   }
+                  list.adapter = ad
+                  list.setSelection(restore); restore = 0
+                  paint()
               }
 
               override fun onDestroy() {
                   super.onDestroy()
                   bg.shutdownNow()
-                  try { renderer?.close() } catch (e: Throwable) {}
+                  try { pdf?.close() } catch (e: Throwable) {}
               }
           }
           EOF_FILE
