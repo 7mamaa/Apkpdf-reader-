@@ -212,6 +212,271 @@ jobs:
               }
           }
           EOF_FILE
+          cat > app/src/main/java/app/fastview/PdfView.kt << 'EOF_FILE'
+          package app.fastview
+
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.*
+          import android.graphics.pdf.PdfRenderer
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.LruCache
+          import android.view.GestureDetector
+          import android.view.MotionEvent
+          import android.view.ScaleGestureDetector
+          import android.view.View
+          import android.widget.OverScroller
+          import java.util.concurrent.Executors
+
+          /** Single-surface PDF view: continuous pinch zoom about the fingers, pan, fling, sharp tiles after the gesture settles. */
+          class PdfView(c: Context) : View(c) {
+              private class Tile(val bm: Bitmap, val x0: Float, val y0: Float, val x1: Float, val y1: Float)
+
+              private var r: PdfRenderer? = null
+              private val ex = Executors.newSingleThreadExecutor()
+              private val hd = Handler(Looper.getMainLooper())
+              private var n = 0
+              private var ratio = FloatArray(0)
+              private var tops = FloatArray(0)
+              private var total = 0f
+              private var zm = 1f
+              private var ox = 0f
+              private var oy = 0f
+              private var gen = 0
+              private var pending = -1
+              private var bgc = Color.DKGRAY
+              private var lfx = 0f
+              private var lfy = 0f
+              private val dn = c.resources.displayMetrics.density
+              private val gap = 8f * dn
+              private val base = object : LruCache<Int, Bitmap>(maxOf(8 shl 20, (Runtime.getRuntime().maxMemory() / 6).toInt())) {
+                  override fun sizeOf(k: Int, b: Bitmap) = b.byteCount
+              }
+              private val tiles = HashMap<Int, Tile>()
+              private val busy = HashSet<Int>()
+              private val busyT = HashSet<Int>()
+              private val scroller = OverScroller(c)
+              private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+              private val white = Paint().apply { color = Color.WHITE }
+              private val pill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xAA000000.toInt() }
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 14f * dn }
+              private val inv = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                  -1f, 0f, 0f, 0f, 255f, 0f, -1f, 0f, 0f, 255f, 0f, 0f, -1f, 0f, 255f, 0f, 0f, 0f, 1f, 0f)))
+              private val sep = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
+                  0.96f, 0f, 0f, 0f, 0f, 0f, 0.9f, 0f, 0f, 0f, 0f, 0f, 0.76f, 0f, 0f, 0f, 0f, 0f, 1f, 0f)))
+              private val settle = Runnable { details() }
+
+              private val sd = ScaleGestureDetector(c, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                  override fun onScaleBegin(d: ScaleGestureDetector): Boolean { lfx = d.focusX; lfy = d.focusY; return true }
+                  override fun onScale(d: ScaleGestureDetector): Boolean {
+                      zoomAt(zm * d.scaleFactor, d.focusX, d.focusY)
+                      ox -= (d.focusX - lfx) / zm; oy -= (d.focusY - lfy) / zm
+                      lfx = d.focusX; lfy = d.focusY
+                      clamp(); moved()
+                      return true
+                  }
+              })
+              private val gd = GestureDetector(c, object : GestureDetector.SimpleOnGestureListener() {
+                  override fun onDown(e: MotionEvent): Boolean { scroller.forceFinished(true); return true }
+                  override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean {
+                      ox += dx / zm; oy += dy / zm; clamp(); moved(); return true
+                  }
+                  override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                      val maxY = ((total - height / zm) * zm).toInt().coerceAtLeast(0)
+                      scroller.fling((ox * zm).toInt(), (oy * zm).toInt(), -vx.toInt(), -vy.toInt(), 0, (width * (zm - 1f)).toInt(), 0, maxY)
+                      postInvalidateOnAnimation(); return true
+                  }
+                  override fun onDoubleTap(e: MotionEvent): Boolean {
+                      ValueAnimator.ofFloat(zm, if (zm > 1.3f) 1f else 2.5f).apply {
+                          duration = 180
+                          addUpdateListener { zoomAt(it.animatedValue as Float, e.x, e.y) }
+                          start()
+                      }
+                      return true
+                  }
+              })
+
+              fun load(pr: PdfRenderer, startPage: Int) {
+                  clear()
+                  r = pr; n = pr.pageCount
+                  val p0 = pr.openPage(0)
+                  val r0 = p0.height.toFloat() / p0.width
+                  p0.close()
+                  ratio = FloatArray(n) { r0 }
+                  pending = startPage
+                  zm = 1f; ox = 0f; oy = 0f
+                  relayout()
+                  ex.execute {
+                      try {
+                          for (i in 1 until n) synchronized(pr) {
+                              val p = pr.openPage(i); ratio[i] = p.height.toFloat() / p.width; p.close()
+                          }
+                      } catch (e: Throwable) {}
+                      post { relayout(); invalidate() }
+                  }
+                  invalidate()
+              }
+
+              fun clear() {
+                  gen++; r = null; n = 0; tops = FloatArray(0); total = 0f
+                  base.evictAll(); tiles.clear(); busy.clear(); busyT.clear(); hd.removeCallbacks(settle)
+              }
+
+              fun theme(t: Int) {
+                  bgc = if (t == 1) Color.BLACK else Color.DKGRAY
+                  val f = when (t) { 1 -> inv; 2 -> sep; else -> null }
+                  paint.colorFilter = f; white.colorFilter = f
+                  invalidate()
+              }
+
+              fun page() = if (tops.size > n && n > 0) pageAt(oy + 1f) else 0
+              fun goTo(p: Int) {
+                  if (tops.size <= n || n == 0) { pending = p; return }
+                  oy = tops[p.coerceIn(0, n - 1)]; clamp(); moved()
+              }
+
+              private fun pageAt(y: Float): Int {
+                  var lo = 0; var hi = n - 1
+                  while (lo < hi) { val m = (lo + hi + 1) / 2; if (tops[m] <= y) lo = m else hi = m - 1 }
+                  return lo
+              }
+
+              private fun relayout() {
+                  val w = width.toFloat()
+                  if (w <= 0f || n == 0) return
+                  tops = FloatArray(n + 1)
+                  for (i in 0 until n) tops[i + 1] = tops[i] + w * ratio[i] + gap
+                  total = tops[n]
+                  if (pending >= 0) { oy = tops[pending.coerceIn(0, n - 1)]; pending = -1 }
+                  clamp()
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                  gen++; base.evictAll(); tiles.clear(); busy.clear(); busyT.clear()
+                  relayout(); moved()
+              }
+
+              private fun clamp() {
+                  val w = width.toFloat(); val h = height.toFloat()
+                  zm = zm.coerceIn(1f, 5f)
+                  ox = ox.coerceIn(0f, maxOf(0f, w - w / zm))
+                  oy = oy.coerceIn(0f, maxOf(0f, total - h / zm))
+              }
+
+              private fun zoomAt(nz: Float, fx: Float, fy: Float) {
+                  val dx = ox + fx / zm; val dy = oy + fy / zm
+                  zm = nz.coerceIn(1f, 5f)
+                  ox = dx - fx / zm; oy = dy - fy / zm
+                  clamp(); moved()
+              }
+
+              private fun moved() { invalidate(); hd.removeCallbacks(settle); hd.postDelayed(settle, 140) }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  sd.onTouchEvent(e)
+                  if (!sd.isInProgress) gd.onTouchEvent(e)
+                  return true
+              }
+
+              override fun computeScroll() {
+                  if (scroller.computeScrollOffset()) {
+                      ox = scroller.currX / zm; oy = scroller.currY / zm
+                      clamp(); moved(); postInvalidateOnAnimation()
+                  }
+              }
+
+              private fun near(i: Int): Boolean {
+                  if (tops.size <= n || n == 0) return false
+                  return i >= pageAt(oy) - 1 && i <= pageAt(oy + height / zm) + 1
+              }
+
+              private fun req(i: Int) {
+                  val pr = r ?: return
+                  if (i !in 0 until n || base.get(i) != null || !busy.add(i)) return
+                  val g = gen; val w = width
+                  ex.execute {
+                      if (!near(i)) { post { busy.remove(i) }; return@execute }
+                      val b = try {
+                          synchronized(pr) {
+                              val p = pr.openPage(i)
+                              try {
+                                  val bm = Bitmap.createBitmap(w, maxOf(1, (w * p.height.toFloat() / p.width).toInt()), Bitmap.Config.ARGB_8888)
+                                  bm.eraseColor(Color.WHITE)
+                                  p.render(bm, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                  bm
+                              } finally { p.close() }
+                          }
+                      } catch (e: Throwable) { null }
+                      post { busy.remove(i); if (b != null && g == gen) { base.put(i, b); invalidate() } }
+                  }
+              }
+
+              // sharp tiles for the visible part of each visible page, rendered once the gesture settles
+              private fun details() {
+                  val pr = r ?: return
+                  if (tops.size <= n || n == 0) return
+                  if (zm < 1.15f) { tiles.clear(); return }
+                  val w = width.toFloat(); val h = height.toFloat()
+                  val g = gen; val z0 = zm; val x0 = ox; val yy = oy
+                  val vis = ArrayList<Int>()
+                  var i = pageAt(yy)
+                  while (i < n && tops[i] < yy + h / z0) { vis.add(i); i++ }
+                  tiles.keys.retainAll(vis.toSet())
+                  for (p in vis) {
+                      val ty0 = maxOf(yy, tops[p]) - tops[p]
+                      val ty1 = minOf(yy + h / z0, tops[p] + w * ratio[p]) - tops[p]
+                      if (ty1 <= ty0 || !busyT.add(p)) continue
+                      val tx1 = x0 + w / z0
+                      val tw = ((tx1 - x0) * z0).toInt().coerceAtLeast(1)
+                      val th = ((ty1 - ty0) * z0).toInt().coerceAtLeast(1)
+                      ex.execute {
+                          val bm = try {
+                              synchronized(pr) {
+                                  val pg = pr.openPage(p)
+                                  try {
+                                      val b = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
+                                      b.eraseColor(Color.WHITE)
+                                      val s = (w * z0) / pg.width
+                                      val m = Matrix()
+                                      m.setScale(s, s); m.postTranslate(-x0 * z0, -ty0 * z0)
+                                      pg.render(b, Rect(0, 0, tw, th), m, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                      b
+                                  } finally { pg.close() }
+                              }
+                          } catch (e: Throwable) { null }
+                          post { busyT.remove(p); if (bm != null && g == gen) { tiles[p] = Tile(bm, x0, ty0, tx1, ty1); invalidate() } }
+                      }
+                  }
+              }
+
+              override fun onDraw(cv: Canvas) {
+                  cv.drawColor(bgc)
+                  if (n == 0 || tops.size <= n) return
+                  val w = width.toFloat(); val h = height.toFloat()
+                  var i = pageAt(oy)
+                  while (i < n && tops[i] < oy + h / zm) {
+                      val l = -ox * zm; val t = (tops[i] - oy) * zm
+                      val dst = RectF(l, t, l + w * zm, t + w * ratio[i] * zm)
+                      val b = base.get(i)
+                      if (b != null) cv.drawBitmap(b, null, dst, paint) else { cv.drawRect(dst, white); req(i) }
+                      tiles[i]?.let { tl ->
+                          cv.drawBitmap(tl.bm, null,
+                              RectF((tl.x0 - ox) * zm, (tops[i] + tl.y0 - oy) * zm, (tl.x1 - ox) * zm, (tops[i] + tl.y1 - oy) * zm), paint)
+                      }
+                      i++
+                  }
+                  if (i < n) req(i)
+                  val s = "${pageAt(oy + 1f) + 1}/$n"
+                  val pad = 8f * dn
+                  val rr = width - 12f * dn
+                  val rl = rr - txt.measureText(s) - 2 * pad
+                  val rb = height - 12f * dn
+                  cv.drawRoundRect(RectF(rl, rb - txt.textSize - 1.5f * pad, rr, rb), 12f * dn, 12f * dn, pill)
+                  cv.drawText(s, rl + pad, rb - pad * 0.9f, txt)
+              }
+          }
+          EOF_FILE
           cat > app/src/main/java/app/fastview/MainActivity.kt << 'EOF_FILE'
           package app.fastview
 
@@ -242,6 +507,8 @@ jobs:
               private lateinit var list: ListView
               private lateinit var root: HorizontalScrollView
               private lateinit var spin: Spinner
+              private lateinit var pv: PdfView
+              private lateinit var host: FrameLayout
               private lateinit var prefs: SharedPreferences
               private var th = 0
               private val night get() = th == 1
@@ -324,6 +591,11 @@ jobs:
                       })
                   }
                   root = HorizontalScrollView(this).apply { isFillViewport = true; addView(list, FrameLayout.LayoutParams(-1, -1)) }
+                  pv = PdfView(this).apply { visibility = View.GONE }
+                  host = FrameLayout(this).apply {
+                      addView(root, FrameLayout.LayoutParams(-1, -1))
+                      addView(pv, FrameLayout.LayoutParams(-1, -1))
+                  }
                   spin = Spinner(this).apply {
                       adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, listOf("Table", "Column", "Raw"))
                       onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -348,21 +620,24 @@ jobs:
                   setContentView(LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       addView(bar, LinearLayout.LayoutParams(-1, -2))
-                      addView(root, LinearLayout.LayoutParams(-1, 0, 1f))
+                      addView(host, LinearLayout.LayoutParams(-1, 0, 1f))
                   })
                   paint()
                   val uri = intent?.data ?: intent?.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
                   if (uri != null) open(uri) else showRecents()
               }
 
-              override fun dispatchTouchEvent(e: MotionEvent): Boolean { sg.onTouchEvent(e); gd.onTouchEvent(e); return super.dispatchTouchEvent(e) }
+              override fun dispatchTouchEvent(e: MotionEvent): Boolean { if (pdf == null) sg.onTouchEvent(e); return super.dispatchTouchEvent(e) }
 
               override fun onPause() {
                   super.onPause()
                   val ed = prefs.edit().putFloat("fs", fs)
-                  if (key.isNotEmpty()) ed.putInt("p$key", list.firstVisiblePosition)
+                  if (key.isNotEmpty()) ed.putInt("p$key", curPos())
                   ed.apply()
               }
+
+              private fun curPos() = if (pdf != null) pv.page() else list.firstVisiblePosition
+              private fun goPos(p: Int) { if (pdf != null) pv.goTo(p) else list.setSelection(p) }
 
               private fun bgc() = if (pdf != null) (if (th == 1) Color.BLACK else Color.DKGRAY)
                   else when (th) { 1 -> 0xFF121212.toInt(); 2 -> 0xFFF4ECD8.toInt(); else -> Color.WHITE }
@@ -370,7 +645,7 @@ jobs:
 
               private fun paint() {
                   val c = bgc()
-                  root.setBackgroundColor(c); list.setBackgroundColor(c)
+                  root.setBackgroundColor(c); list.setBackgroundColor(c); pv.theme(th)
                   ad?.notifyDataSetChanged()
               }
 
@@ -407,7 +682,7 @@ jobs:
                       3 -> pick()
                       4 -> if (pdf != null) toast("Search works on text files") else ask("Find", false) { q = it; qpos = 0; next() }
                       5 -> next()
-                      6 -> ask("Page / line number", true) { s -> s.toIntOrNull()?.let { list.setSelection(if (pdf != null) it - 1 else (it - 1) / 60) } }
+                      6 -> ask("Page / line number", true) { s -> s.toIntOrNull()?.let { goPos(if (pdf != null) it - 1 else (it - 1) / 60) } }
                       7 -> showRecents()
                       8 -> share()
                       9 -> bmAdd()
@@ -450,7 +725,7 @@ jobs:
 
               private fun bmAdd() {
                   if (key.isEmpty()) return
-                  val p = list.firstVisiblePosition
+                  val p = curPos()
                   prefs.edit().putString("b$key", prefs.getString("b$key", "") + p + "\n").apply()
                   toast("Bookmarked " + lab(p))
               }
@@ -459,7 +734,7 @@ jobs:
                   val ps = prefs.getString("b$key", "")!!.split('\n').mapNotNull { it.toIntOrNull() }.distinct().sorted()
                   if (ps.isEmpty()) { toast("No bookmarks"); return }
                   AlertDialog.Builder(this).setTitle("Bookmarks")
-                      .setItems(ps.map { lab(it) }.toTypedArray()) { _, i -> list.setSelection(ps[i]) }.show()
+                      .setItems(ps.map { lab(it) }.toTypedArray()) { _, i -> goPos(ps[i]) }.show()
               }
 
               private fun openUrl(s: String) {
@@ -553,6 +828,7 @@ jobs:
               }
 
               private fun reset() {
+                  pv.clear(); pv.visibility = View.GONE; root.visibility = View.VISIBLE
                   try { pdf?.close() } catch (e: Throwable) {}
                   pdf = null; cur = null; busy.clear(); gen++; z = 1f; grid = null; hs = false; q = ""; key = ""
                   bar.visibility = View.GONE; filt = ""; sortCol = -1; sheets = emptyList()
@@ -564,7 +840,7 @@ jobs:
               private fun showRecents() {
                   reset(); title = "FastView"
                   val r = recents()
-                  val items = listOf("Open file...") + r.map { it.second }
+                  val items = listOf("+  Open a file") + r.map { it.second }
                   val pad = (16 * dm.density).toInt()
                   ad = object : BaseAdapter() {
                       override fun getCount() = items.size
@@ -572,8 +848,19 @@ jobs:
                       override fun getItemId(i: Int) = i.toLong()
                       override fun getView(i: Int, v: View?, p: ViewGroup): View {
                           val tv = (v as? TextView) ?: TextView(this@MainActivity).apply { textSize = 16f; setPadding(pad, pad, pad, pad) }
-                          tv.text = items[i]
-                          tv.setTextColor(fg())
+                          val sb = SpannableStringBuilder(items[i])
+                          if (i == 0) {
+                              sb.setSpan(StyleSpan(Typeface.BOLD), 0, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                              tv.setTextColor(0xFF2E7D32.toInt())
+                          } else {
+                              val x = items[i].substringAfterLast('.', "").uppercase()
+                              val st = sb.length
+                              sb.append("\n").append(if (x.isEmpty()) "FILE" else x)
+                              sb.setSpan(RelativeSizeSpan(0.75f), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                              sb.setSpan(ForegroundColorSpan(0xFF8A8A8A.toInt()), st, sb.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                              tv.setTextColor(fg())
+                          }
+                          tv.text = sb
                           return tv
                       }
                   }
@@ -754,71 +1041,19 @@ jobs:
                   paint()
               }
 
-              // ---- pdf
-              private fun render(i: Int) {
-                  val r = pdf ?: return
-                  if (!busy.add(i)) return
-                  val g = gen
-                  val w = (dm.widthPixels * z).toInt()
-                  bg.execute {
-                      val b = try {
-                          synchronized(r) {
-                              val pg = r.openPage(i)
-                              try {
-                                  val bm = Bitmap.createBitmap(w, maxOf(1, (w * pg.height.toFloat() / pg.width).toInt()), Bitmap.Config.ARGB_8888)
-                                  bm.eraseColor(Color.WHITE)
-                                  pg.render(bm, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                                  bm
-                              } finally { pg.close() }
-                          }
-                      } catch (e: Throwable) { null }
-                      runOnUiThread {
-                          busy.remove(i)
-                          if (g != gen) ad?.notifyDataSetChanged()
-                          else if (b != null) { cache?.put(i, b); list.findViewWithTag<ImageView>(i)?.setImageBitmap(b) }
-                      }
-                  }
-              }
-
+              // ---- pdf (drawn by PdfView)
               private fun showPdf(u: Uri) {
                   val fd = contentResolver.openFileDescriptor(u, "r") ?: return
                   val r = PdfRenderer(fd)
+                  pv.load(r, restore); restore = 0
                   pdf = r
-                  cache = object : LruCache<Int, Bitmap>((Runtime.getRuntime().maxMemory() / 5).toInt()) {
-                      override fun sizeOf(k: Int, b: Bitmap) = b.byteCount
-                  }
-                  list.dividerHeight = 6
-                  ad = object : BaseAdapter() {
-                      override fun getCount() = r.pageCount
-                      override fun getItem(i: Int): Any = i
-                      override fun getItemId(i: Int) = i.toLong()
-                      override fun getView(i: Int, v: View?, p: ViewGroup): View {
-                          val iv = (v as? ImageView) ?: ImageView(this@MainActivity).apply {
-                              adjustViewBounds = true
-                              scaleType = ImageView.ScaleType.FIT_CENTER
-                              layoutParams = AbsListView.LayoutParams(-1, -2)
-                          }
-                          iv.tag = i
-                          iv.colorFilter = when (th) { 1 -> inv; 2 -> sep; else -> null }
-                          val c = cache?.get(i)
-                          if (c != null) iv.setImageBitmap(c)
-                          else {
-                              iv.setImageDrawable(null)
-                              iv.minimumHeight = (dm.widthPixels * z * 1.41f).toInt()
-                              render(i)
-                          }
-                          if (i + 1 < r.pageCount && cache?.get(i + 1) == null) render(i + 1)
-                          return iv
-                      }
-                  }
-                  list.adapter = ad
-                  list.setSelection(restore); restore = 0
+                  root.visibility = View.GONE; pv.visibility = View.VISIBLE
                   paint()
               }
 
               override fun onDestroy() {
                   super.onDestroy()
-                  bg.shutdownNow()
+                  bg.shutdownNow(); pv.clear()
                   try { pdf?.close() } catch (e: Throwable) {}
               }
           }
